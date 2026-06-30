@@ -7,6 +7,17 @@ except ImportError:
 
 
 class TokenBuffer:
+    __slots__ = (
+        "tokens",
+        "loss_mask",
+        "logprobs",
+        "segments",
+        "rewrite_points",
+        "truncated",
+        "_loss_mask_tensor",
+        "_tensor_dirty",
+    )
+
     def __init__(self, initial_tokens: Optional[List[int]] = None):
         self.tokens: List[int] = list(initial_tokens) if initial_tokens is not None else []
         self.loss_mask: List[int] = [0] * len(self.tokens)
@@ -14,6 +25,8 @@ class TokenBuffer:
         self.segments: List[Dict] = []
         self.rewrite_points: List[int] = []
         self.truncated: bool = False
+        self._loss_mask_tensor = None
+        self._tensor_dirty = True
         if self.tokens:
             self.segments.append({"start": 0, "end": len(self.tokens), "type": "prompt", "loss": False})
 
@@ -28,6 +41,7 @@ class TokenBuffer:
         else:
             self.logprobs.extend([None] * len(ids))
         self.segments.append({"start": start, "end": len(self.tokens), "type": seg_type, "loss": loss})
+        self._tensor_dirty = True
 
     def append_prompt(self, ids: List[int]):
         self._append(ids, "prompt", False)
@@ -47,7 +61,14 @@ class TokenBuffer:
     def get_loss_mask_tensor(self, device: Optional[str] = None):
         if torch is None:
             raise ImportError("torch is required for tensor conversion")
-        return torch.tensor(self.loss_mask, dtype=torch.long, device=device)
+        if self._tensor_dirty or self._loss_mask_tensor is None:
+            self._loss_mask_tensor = torch.tensor(self.loss_mask, dtype=torch.long, device=device)
+            self._tensor_dirty = False
+        elif device is not None:
+            target_device = torch.device(device)
+            if self._loss_mask_tensor.device != target_device:
+                self._loss_mask_tensor = self._loss_mask_tensor.to(target_device)
+        return self._loss_mask_tensor
 
     def get_assistant_ranges(self) -> List[Tuple[int, int]]:
         return [(s["start"], s["end"]) for s in self.segments if s.get("type") == "assistant" and s.get("loss")]
@@ -56,18 +77,20 @@ class TokenBuffer:
         return self.logprobs
 
     def get_assistant_logprobs(self) -> List[Optional[float]]:
-        lps: List[Optional[float]] = []
-        for s in self.segments:
-            if s.get("type") == "assistant" and s.get("loss"):
-                lps.extend(self.logprobs[s["start"]:s["end"]])
-        return lps
+        return [
+            self.logprobs[i]
+            for s in self.segments
+            if s.get("type") == "assistant" and s.get("loss")
+            for i in range(s["start"], s["end"])
+        ]
 
     def record_rewrite(self, at_token_index: int):
         if at_token_index < 0 or at_token_index > len(self.tokens):
             raise ValueError("invalid rewrite point")
         self.rewrite_points.append(at_token_index)
-        for i in range(at_token_index):
-            self.loss_mask[i] = 0
+        if at_token_index > 0:
+            self.loss_mask[:at_token_index] = [0] * at_token_index
+        self._tensor_dirty = True
 
     def get_rewrite_points(self) -> List[int]:
         return self.rewrite_points
